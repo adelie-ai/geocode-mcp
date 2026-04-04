@@ -1,0 +1,12 @@
+/home/dave/projects/adelie-platform/geocode-mcp/target/debug/deps/matchit-263546d8a66c02c6.d: /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/lib.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/error.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/escape.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/params.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/router.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/tree.rs
+
+/home/dave/projects/adelie-platform/geocode-mcp/target/debug/deps/libmatchit-263546d8a66c02c6.rlib: /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/lib.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/error.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/escape.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/params.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/router.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/tree.rs
+
+/home/dave/projects/adelie-platform/geocode-mcp/target/debug/deps/libmatchit-263546d8a66c02c6.rmeta: /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/lib.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/error.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/escape.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/params.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/router.rs /home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/tree.rs
+
+/home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/lib.rs:
+/home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/error.rs:
+/home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/escape.rs:
+/home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/params.rs:
+/home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/router.rs:
+/home/dave/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.8.4/src/tree.rs:
