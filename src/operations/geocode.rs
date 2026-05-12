@@ -43,15 +43,13 @@ pub async fn geocode_location(
     let count = count.clamp(1, 10);
     let language = language.unwrap_or("en");
 
-    let url = format!(
-        "https://photon.komoot.io/api/?q={}&limit={}&lang={}",
-        urlencoding(name),
-        count,
-        language
-    );
-
     let resp = client
-        .get(&url)
+        .get("https://photon.komoot.io/api/")
+        .query(&[
+            ("q", name),
+            ("limit", &count.to_string()),
+            ("lang", language),
+        ])
         .header("User-Agent", "geocode-mcp/0.1.0")
         .send()
         .await?
@@ -99,16 +97,4 @@ pub async fn geocode_location(
     }
 
     Ok(serde_json::json!(locations))
-}
-
-fn urlencoding(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-                vec![c]
-            } else {
-                format!("%{:02X}", c as u32).chars().collect()
-            }
-        })
-        .collect()
 }
