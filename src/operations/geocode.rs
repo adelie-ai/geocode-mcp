@@ -57,11 +57,9 @@ pub async fn geocode_location(
         .await?;
 
     if resp.features.is_empty() {
-        return Err(GeocodeError::LocationNotFound(format!(
-            "No locations found for: {}",
-            name
-        ))
-        .into());
+        return Err(
+            GeocodeError::LocationNotFound(format!("No locations found for: {}", name)).into(),
+        );
     }
 
     let locations: Vec<Value> = resp
@@ -89,11 +87,9 @@ pub async fn geocode_location(
         .collect();
 
     if locations.is_empty() {
-        return Err(GeocodeError::LocationNotFound(format!(
-            "No locations found for: {}",
-            name
-        ))
-        .into());
+        return Err(
+            GeocodeError::LocationNotFound(format!("No locations found for: {}", name)).into(),
+        );
     }
 
     Ok(serde_json::json!(locations))

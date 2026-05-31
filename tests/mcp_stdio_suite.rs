@@ -1,6 +1,6 @@
 #![deny(warnings)]
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
@@ -118,10 +118,10 @@ fn extract_value(tool_result: &Value) -> Value {
         .unwrap_or_else(|| panic!("expected result.content array, got: {tool_result}"));
 
     for entry in content {
-        if entry.get("type") == Some(&Value::String("json".to_string())) {
-            if let Some(v) = entry.get("value") {
-                return v.clone();
-            }
+        if entry.get("type") == Some(&Value::String("json".to_string()))
+            && let Some(v) = entry.get("value")
+        {
+            return v.clone();
         }
     }
 
@@ -330,10 +330,7 @@ fn test_geocode_nonexistent_location_network() {
     let mut client = McpStdioClient::start();
     client.initialize();
 
-    let result = client.tool_call(
-        "geocode",
-        json!({"name": "xyzzy_nonexistent_place_00000"}),
-    );
+    let result = client.tool_call("geocode", json!({"name": "xyzzy_nonexistent_place_00000"}));
     assert!(
         result.is_err(),
         "expected error for nonexistent location, but got success"
