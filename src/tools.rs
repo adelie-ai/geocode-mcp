@@ -57,16 +57,13 @@ impl ToolRegistry {
         let name = arguments
             .get("name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| McpError::InvalidToolParameters("Missing required parameter: name".to_string()))?;
+            .ok_or_else(|| {
+                McpError::InvalidToolParameters("Missing required parameter: name".to_string())
+            })?;
 
-        let count = arguments
-            .get("count")
-            .and_then(value_as_u64)
-            .unwrap_or(5) as u32;
+        let count = arguments.get("count").and_then(value_as_u64).unwrap_or(5) as u32;
 
-        let language = arguments
-            .get("language")
-            .and_then(|v| v.as_str());
+        let language = arguments.get("language").and_then(|v| v.as_str());
 
         let result = geocode::geocode_location(&self.client, name, count, language).await?;
 

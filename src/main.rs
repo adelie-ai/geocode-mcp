@@ -1,10 +1,10 @@
 #![deny(warnings)]
 
 use axum::{
-    extract::{ws::WebSocketUpgrade, State},
+    Router,
+    extract::{State, ws::WebSocketUpgrade},
     response::Response,
     routing::get,
-    Router,
 };
 use clap::{Parser, ValueEnum};
 use geocode_mcp::error::Result;
@@ -172,10 +172,11 @@ async fn handle_websocket_connection(socket: axum::extract::ws::WebSocket, serve
 
                 if let Some(resp) = response
                     && let Ok(resp_str) = serde_json::to_string(&resp)
-                        && let Err(e) = sender.send(Message::Text(resp_str.into())).await {
-                            eprintln!("Error sending WebSocket response: {}", e);
-                            break;
-                        }
+                    && let Err(e) = sender.send(Message::Text(resp_str.into())).await
+                {
+                    eprintln!("Error sending WebSocket response: {}", e);
+                    break;
+                }
             }
             Ok(Message::Close(_)) => {
                 break;
@@ -191,11 +192,12 @@ async fn handle_websocket_connection(socket: axum::extract::ws::WebSocket, serve
 
 async fn handle_jsonrpc_message(server: Arc<McpServer>, message: Value) -> Option<Value> {
     if let Some(jsonrpc_version) = message.get("jsonrpc").and_then(|v| v.as_str())
-        && jsonrpc_version != "2.0" {
-            let id = message.get("id").cloned();
-            let error_msg = format!("Invalid JSON-RPC version: {}", jsonrpc_version);
-            return Some(jsonrpc_error_response(id, -32600, &error_msg, None));
-        }
+        && jsonrpc_version != "2.0"
+    {
+        let id = message.get("id").cloned();
+        let error_msg = format!("Invalid JSON-RPC version: {}", jsonrpc_version);
+        return Some(jsonrpc_error_response(id, -32600, &error_msg, None));
+    }
 
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(|m| m.as_str());
