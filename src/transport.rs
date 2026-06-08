@@ -160,6 +160,17 @@ impl StdioTransportHandler {
             ))
         })?;
 
+        // Guard against unbounded allocation: a legitimate MCP message will never
+        // approach 16 MiB; anything larger is either a bug or an adversarial input.
+        const MAX_CONTENT_LENGTH: usize = 16 * 1024 * 1024; // 16 MiB
+        if content_length > MAX_CONTENT_LENGTH {
+            return Err(TransportError::InvalidMessage(format!(
+                "Content-Length {} exceeds maximum allowed size of {} bytes",
+                content_length, MAX_CONTENT_LENGTH,
+            ))
+            .into());
+        }
+
         loop {
             let mut header_line = String::new();
             let n = self

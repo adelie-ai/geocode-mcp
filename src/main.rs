@@ -253,10 +253,21 @@ async fn handle_jsonrpc_message(server: Arc<McpServer>, message: Value) -> Optio
             let arguments = params.get("arguments").unwrap_or(&Value::Null);
 
             if let Some(name) = tool_name {
-                match server.handle_tool_call(name, arguments).await {
-                    Ok(result) => Ok(result),
-                    Err(e) => Err(e),
-                }
+                // Tool-execution errors are NOT JSON-RPC errors: per MCP spec they must be
+                // returned as a successful response with `isError: true` so the LLM can read
+                // the error message as tool output rather than as a transport failure.
+                let tool_result = match server.handle_tool_call(name, arguments).await {
+                    Ok(result) => result,
+                    Err(e) => serde_json::json!({
+                        "content": [{"type": "text", "text": e.to_string()}],
+                        "isError": true,
+                    }),
+                };
+                return Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": tool_result,
+                }));
             } else {
                 return Some(jsonrpc_error_response(
                     id,

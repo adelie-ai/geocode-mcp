@@ -94,11 +94,30 @@ impl McpStdioClient {
         self.notify("initialized", json!({}));
     }
 
+    /// Call a tool and return Ok(result) for success or Err(message) for both
+    /// JSON-RPC errors and MCP-level tool errors (`isError: true`).
     fn tool_call(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
         let resp = self.call("tools/call", json!({"name":name,"arguments":arguments}))?;
-        resp.get("result")
+        let result = resp
+            .get("result")
             .cloned()
-            .ok_or_else(|| format!("missing result field: {resp}"))
+            .ok_or_else(|| format!("missing result field: {resp}"))?;
+
+        // Per MCP spec, tool errors come back as isError:true in the result body —
+        // surface them as Err so test assertions stay natural.
+        if result.get("isError") == Some(&Value::Bool(true)) {
+            let msg = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|entry| entry.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("tool error")
+                .to_string();
+            return Err(msg);
+        }
+
+        Ok(result)
     }
 }
 
@@ -110,31 +129,36 @@ impl Drop for McpStdioClient {
     }
 }
 
-/// Extract the `value` field from the first `type: json` content entry.
-fn extract_value(tool_result: &Value) -> Value {
+/// Extract the JSON payload from the first `type: text` content entry.
+///
+/// The server now emits `{"type":"text","text":"<json string>"}` (MCP spec).
+fn extract_text_as_value(tool_result: &Value) -> Value {
     let content = tool_result
         .get("content")
         .and_then(|v| v.as_array())
         .unwrap_or_else(|| panic!("expected result.content array, got: {tool_result}"));
 
     for entry in content {
-        if entry.get("type") == Some(&Value::String("json".to_string()))
-            && let Some(v) = entry.get("value")
-        {
-            return v.clone();
+        if entry.get("type") == Some(&Value::String("text".to_string())) {
+            let text = entry
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or_else(|| panic!("text entry missing 'text' field: {entry}"));
+            return serde_json::from_str(text)
+                .unwrap_or_else(|e| panic!("text content is not valid JSON: {e}\n  text: {text}"));
         }
     }
 
-    panic!("no json content entry in: {tool_result}");
+    panic!("no text content entry in: {tool_result}");
 }
 
 fn network_tests_enabled() -> bool {
     std::env::var("RUN_NETWORK_TESTS").ok().as_deref() == Some("1")
 }
 
-fn expect_err_contains<T>(res: Result<T, String>, needle: &str) {
+fn expect_err_contains<T: std::fmt::Debug>(res: Result<T, String>, needle: &str) {
     match res {
-        Ok(_) => panic!("expected error containing '{needle}', but call succeeded"),
+        Ok(v) => panic!("expected error containing '{needle}', but call succeeded: {v:?}"),
         Err(e) => {
             let lower = e.to_lowercase();
             assert!(
@@ -147,7 +171,8 @@ fn expect_err_contains<T>(res: Result<T, String>, needle: &str) {
 
 // ── Protocol tests (no network) ───────────────────────────────────────────────
 
-/// The server must respond to `initialize` with serverInfo and capabilities.
+/// The server must respond to `initialize` with serverInfo and capabilities,
+/// and must NOT include a non-standard top-level `tools` key.
 #[test]
 fn test_initialize_response_shape() {
     let mut client = McpStdioClient::start();
@@ -172,6 +197,11 @@ fn test_initialize_response_shape() {
     assert!(
         result.get("capabilities").is_some(),
         "missing capabilities: {result}"
+    );
+    // Non-standard `tools` key must be absent from initialize response
+    assert!(
+        result.get("tools").is_none(),
+        "initialize result must not contain top-level 'tools' key: {result}"
     );
 }
 
@@ -207,7 +237,7 @@ fn test_tools_list_contains_expected_tools() {
             .collect()
     };
 
-    let expected = ["geocode"];
+    let expected = ["geocode", "reverse_geocode"];
 
     for expected_name in &expected {
         assert!(
@@ -230,9 +260,9 @@ fn test_tool_call_before_initialize_returns_error() {
     );
 }
 
-/// An unknown tool name must return a ToolNotFound error.
+/// An unknown tool name must return a tool error (isError:true), not a JSON-RPC error.
 #[test]
-fn test_unknown_tool_returns_error() {
+fn test_unknown_tool_returns_is_error() {
     let mut client = McpStdioClient::start();
     client.initialize();
     let result = client.tool_call("nonexistent_tool", json!({}));
@@ -277,6 +307,336 @@ fn test_geocode_missing_name() {
     expect_err_contains(result, "name");
 }
 
+/// `geocode` must reject an empty name.
+#[test]
+fn test_geocode_empty_name_rejected() {
+    let mut client = McpStdioClient::start();
+    client.initialize();
+    let result = client.tool_call("geocode", json!({"name": ""}));
+    expect_err_contains(result, "empty");
+}
+
+/// `geocode` must reject a whitespace-only name.
+#[test]
+fn test_geocode_whitespace_name_rejected() {
+    let mut client = McpStdioClient::start();
+    client.initialize();
+    let result = client.tool_call("geocode", json!({"name": "   "}));
+    expect_err_contains(result, "empty");
+}
+
+/// `reverse_geocode` must reject missing latitude.
+#[test]
+fn test_reverse_geocode_missing_latitude() {
+    let mut client = McpStdioClient::start();
+    client.initialize();
+    let result = client.tool_call("reverse_geocode", json!({"longitude": -0.1278}));
+    expect_err_contains(result, "latitude");
+}
+
+/// `reverse_geocode` must reject missing longitude.
+#[test]
+fn test_reverse_geocode_missing_longitude() {
+    let mut client = McpStdioClient::start();
+    client.initialize();
+    let result = client.tool_call("reverse_geocode", json!({"latitude": 51.5074}));
+    expect_err_contains(result, "longitude");
+}
+
+// ── httpmock-based unit tests (run unconditionally — no external network needed) ─
+
+#[cfg(test)]
+mod httpmock_tests {
+    use geocode_mcp::operations::geocode::geocode_location_with_base;
+    use geocode_mcp::operations::reverse_geocode::reverse_geocode_location_with_base;
+    use httpmock::prelude::*;
+    use std::time::Duration;
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client")
+    }
+
+    /// Zero-feature response must produce an isError-style LocationNotFound error.
+    #[tokio::test]
+    async fn test_geocode_empty_features_is_location_not_found() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"features":[]}"#);
+            })
+            .await;
+
+        let client = test_client();
+        let base = format!("http://{}/api/", server.address());
+        let result = geocode_location_with_base(&client, &base, "Atlantis", 5, None).await;
+
+        assert!(result.is_err(), "expected LocationNotFound error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.to_lowercase().contains("not found"),
+            "expected 'not found' in error, got: {err}"
+        );
+    }
+
+    /// Malformed JSON from Photon (missing geometry.coordinates) must be handled gracefully.
+    #[tokio::test]
+    async fn test_geocode_missing_coordinates_filtered_out() {
+        let server = MockServer::start_async().await;
+        // Feature with coordinates array too short; should be filtered and trigger LocationNotFound
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(
+                        r#"{
+                            "features": [
+                                {
+                                    "properties": {"name": "Broken", "country": "Nowhere"},
+                                    "geometry": {"coordinates": []}
+                                }
+                            ]
+                        }"#,
+                    );
+            })
+            .await;
+
+        let client = test_client();
+        let base = format!("http://{}/api/", server.address());
+        let result = geocode_location_with_base(&client, &base, "Broken", 5, None).await;
+
+        assert!(result.is_err(), "expected error for missing coordinates");
+    }
+
+    /// HTTP 429 from Photon must surface as an ApiError, not a panic or timeout.
+    #[tokio::test]
+    async fn test_geocode_http_429_propagates() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/");
+                then.status(429);
+            })
+            .await;
+
+        let client = test_client();
+        let base = format!("http://{}/api/", server.address());
+        let result = geocode_location_with_base(&client, &base, "London", 5, None).await;
+
+        assert!(result.is_err(), "expected error for HTTP 429");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("429"),
+            "expected 429 in error message, got: {err}"
+        );
+    }
+
+    /// HTTP 503 from Photon must surface as an ApiError.
+    #[tokio::test]
+    async fn test_geocode_http_503_propagates() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/");
+                then.status(503);
+            })
+            .await;
+
+        let client = test_client();
+        let base = format!("http://{}/api/", server.address());
+        let result = geocode_location_with_base(&client, &base, "London", 5, None).await;
+
+        assert!(result.is_err(), "expected error for HTTP 503");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("503"),
+            "expected 503 in error message, got: {err}"
+        );
+    }
+
+    /// count must be clamped: 0 → 1, 11 → 10.
+    #[tokio::test]
+    async fn test_geocode_count_clamping() {
+        let server = MockServer::start_async().await;
+
+        // Accept any limit value; return a single feature
+        let feature = r#"{
+            "features": [{
+                "properties": {"name": "London", "country": "United Kingdom", "countrycode": "GB", "state": "England", "type": "city"},
+                "geometry": {"coordinates": [-0.1278, 51.5074]}
+            }]
+        }"#;
+
+        server
+            .mock_async(|when, then| {
+                // count=0 should be clamped to 1
+                when.method(GET).path("/api/").query_param("limit", "1");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(feature);
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                // count=11 should be clamped to 10
+                when.method(GET).path("/api/").query_param("limit", "10");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(feature);
+            })
+            .await;
+
+        let client = test_client();
+        let base = format!("http://{}/api/", server.address());
+
+        let r0 = geocode_location_with_base(&client, &base, "London", 0, None).await;
+        assert!(r0.is_ok(), "count=0 clamped to 1 should succeed: {r0:?}");
+
+        let r11 = geocode_location_with_base(&client, &base, "London", 11, None).await;
+        assert!(
+            r11.is_ok(),
+            "count=11 clamped to 10 should succeed: {r11:?}"
+        );
+    }
+
+    /// A valid Photon response must parse into expected fields.
+    #[tokio::test]
+    async fn test_geocode_valid_response_parsed() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(
+                        r#"{
+                            "features": [{
+                                "properties": {
+                                    "name": "London",
+                                    "country": "United Kingdom",
+                                    "countrycode": "GB",
+                                    "state": "England",
+                                    "type": "city"
+                                },
+                                "geometry": {"coordinates": [-0.1278, 51.5074]}
+                            }]
+                        }"#,
+                    );
+            })
+            .await;
+
+        let client = test_client();
+        let base = format!("http://{}/api/", server.address());
+        let result = geocode_location_with_base(&client, &base, "London", 1, None)
+            .await
+            .expect("geocode should succeed");
+
+        let arr = result.as_array().expect("result should be array");
+        assert_eq!(arr.len(), 1);
+        let loc = &arr[0];
+        assert_eq!(loc["name"], "London");
+        assert_eq!(loc["country_code"], "GB");
+        // GeoJSON [lon, lat] → mapped correctly
+        assert!((loc["latitude"].as_f64().unwrap() - 51.5074).abs() < 0.001);
+        assert!((loc["longitude"].as_f64().unwrap() - (-0.1278)).abs() < 0.001);
+    }
+
+    /// reverse_geocode: HTTP 429 must propagate as an error.
+    #[tokio::test]
+    async fn test_reverse_geocode_http_429_propagates() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/reverse");
+                then.status(429);
+            })
+            .await;
+
+        let client = test_client();
+        let base = format!("http://{}/reverse", server.address());
+        let result =
+            reverse_geocode_location_with_base(&client, &base, 51.5074, -0.1278, None).await;
+
+        assert!(result.is_err(), "expected error for HTTP 429");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("429"),
+            "expected 429 in error message, got: {err}"
+        );
+    }
+
+    /// reverse_geocode: empty features must produce LocationNotFound.
+    #[tokio::test]
+    async fn test_reverse_geocode_empty_features_is_location_not_found() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/reverse");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"features":[]}"#);
+            })
+            .await;
+
+        let client = test_client();
+        let base = format!("http://{}/reverse", server.address());
+        let result =
+            reverse_geocode_location_with_base(&client, &base, 51.5074, -0.1278, None).await;
+
+        assert!(result.is_err(), "expected LocationNotFound");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.to_lowercase().contains("not found"),
+            "expected 'not found', got: {err}"
+        );
+    }
+
+    /// reverse_geocode: valid response must parse correctly.
+    #[tokio::test]
+    async fn test_reverse_geocode_valid_response_parsed() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/reverse");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(
+                        r#"{
+                            "features": [{
+                                "properties": {
+                                    "name": "London",
+                                    "country": "United Kingdom",
+                                    "countrycode": "GB",
+                                    "state": "England",
+                                    "type": "city"
+                                },
+                                "geometry": {"coordinates": [-0.1278, 51.5074]}
+                            }]
+                        }"#,
+                    );
+            })
+            .await;
+
+        let client = test_client();
+        let base = format!("http://{}/reverse", server.address());
+        let result = reverse_geocode_location_with_base(&client, &base, 51.5074, -0.1278, None)
+            .await
+            .expect("reverse geocode should succeed");
+
+        assert_eq!(result["name"], "London");
+        assert_eq!(result["country_code"], "GB");
+        assert!((result["latitude"].as_f64().unwrap() - 51.5074).abs() < 0.001);
+        assert!((result["longitude"].as_f64().unwrap() - (-0.1278)).abs() < 0.001);
+    }
+}
+
 // ── Network integration tests (require RUN_NETWORK_TESTS=1) ──────────────────
 
 /// Geocode "London" and verify we get a plausible UK result.
@@ -294,7 +654,7 @@ fn test_geocode_london_network() {
         .tool_call("geocode", json!({"name": "London", "count": 3}))
         .expect("geocode London");
 
-    let locations = extract_value(&result);
+    let locations = extract_text_as_value(&result);
     let arr = locations.as_array().expect("expected array of locations");
     assert!(!arr.is_empty(), "expected at least one geocode result");
 
@@ -319,7 +679,7 @@ fn test_geocode_london_network() {
     );
 }
 
-/// Geocode an unknown location must return a LocationNotFound error.
+/// Geocode an unknown location must return an isError response (not JSON-RPC error).
 #[test]
 fn test_geocode_nonexistent_location_network() {
     if !network_tests_enabled() {
@@ -333,7 +693,7 @@ fn test_geocode_nonexistent_location_network() {
     let result = client.tool_call("geocode", json!({"name": "xyzzy_nonexistent_place_00000"}));
     assert!(
         result.is_err(),
-        "expected error for nonexistent location, but got success"
+        "expected isError for nonexistent location, but got success"
     );
 }
 
@@ -355,7 +715,7 @@ fn test_geocode_with_language_network() {
         )
         .expect("geocode Tokyo in Japanese");
 
-    let locations = extract_value(&result);
+    let locations = extract_text_as_value(&result);
     let arr = locations.as_array().expect("expected array of locations");
     assert!(!arr.is_empty(), "expected at least one geocode result");
 
