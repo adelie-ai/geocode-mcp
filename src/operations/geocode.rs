@@ -7,6 +7,8 @@ use crate::error::{GeocodeError, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+const PHOTON_API_URL: &str = "https://photon.komoot.io/api/";
+
 #[derive(Debug, Deserialize)]
 struct PhotonResponse {
     features: Vec<PhotonFeature>,
@@ -40,21 +42,44 @@ pub async fn geocode_location(
     count: u32,
     language: Option<&str>,
 ) -> Result<Value> {
+    geocode_location_with_base(client, PHOTON_API_URL, name, count, language).await
+}
+
+/// Geocode against a configurable base URL (used in tests to point at httpmock).
+pub async fn geocode_location_with_base(
+    client: &reqwest::Client,
+    base_url: &str,
+    name: &str,
+    count: u32,
+    language: Option<&str>,
+) -> Result<Value> {
     let count = count.clamp(1, 10);
     let language = language.unwrap_or("en");
 
-    let resp = client
-        .get("https://photon.komoot.io/api/")
+    let response = client
+        .get(base_url)
         .query(&[
             ("q", name),
             ("limit", &count.to_string()),
             ("lang", language),
         ])
-        .header("User-Agent", "geocode-mcp/0.1.0")
+        .header(
+            "User-Agent",
+            concat!("geocode-mcp/", env!("CARGO_PKG_VERSION")),
+        )
         .send()
-        .await?
-        .json::<PhotonResponse>()
         .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(GeocodeError::ApiError(format!(
+            "Photon API returned HTTP {}",
+            status.as_u16()
+        ))
+        .into());
+    }
+
+    let resp = response.json::<PhotonResponse>().await?;
 
     if resp.features.is_empty() {
         return Err(
