@@ -205,6 +205,39 @@ fn test_initialize_response_shape() {
     );
 }
 
+/// The `initialize` response must carry a non-empty `instructions` string that
+/// names the server's tools — this is exactly the value the daemon indexes as
+/// the server's searchable, model-facing description.
+#[test]
+fn test_initialize_advertises_non_empty_instructions() {
+    let mut client = McpStdioClient::start();
+    let resp = client
+        .call(
+            "initialize",
+            json!({"protocolVersion":"2025-11-25","capabilities":{}}),
+        )
+        .expect("initialize");
+
+    let result = resp.get("result").expect("result field");
+    let instructions = result
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("initialize result must include instructions: {result}"));
+
+    assert!(
+        !instructions.trim().is_empty(),
+        "instructions must not be empty: {result}"
+    );
+
+    let lower = instructions.to_lowercase();
+    for needle in ["geocode", "reverse_geocode", "coordinates"] {
+        assert!(
+            lower.contains(needle),
+            "instructions should mention '{needle}', got: {instructions}"
+        );
+    }
+}
+
 /// `tools/list` must return the expected set of tool names.
 #[test]
 fn test_tools_list_contains_expected_tools() {
