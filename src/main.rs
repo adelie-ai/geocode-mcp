@@ -158,16 +158,83 @@ fn value_as_u64(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_str()?.parse::<u64>().ok())
 }
 
+/// Build the MCP server configuration.
+///
+/// The `instructions` blurb is emitted in the `initialize` response and is what
+/// the daemon indexes as this server's model-facing, searchable description, so
+/// it must lead with purpose and name the tools.
+fn server_config() -> ServerConfig {
+    ServerConfig::new("geocode-mcp", env!("CARGO_PKG_VERSION"))
+        .without_websocket()
+        .instructions(
+            "Geocoding tools backed by the Photon API (OpenStreetMap): \
+             resolve place names to coordinates and back.",
+        )
+}
+
 #[tokio::main]
 async fn main() -> mcp_core::Result<()> {
-    mcp_core::run_simple(
-        ServerConfig::new("geocode-mcp", env!("CARGO_PKG_VERSION"))
-            .without_websocket()
-            .instructions(
-                "Geocoding tools backed by the Photon API (OpenStreetMap): \
-                 resolve place names to coordinates and back.",
-            ),
-        || async { Ok(GeocodeService::new()) },
-    )
-    .await
+    mcp_core::run_simple(server_config(), || async { Ok(GeocodeService::new()) }).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Look up a tool's description by name from the live service definition.
+    fn tool_description(name: &str) -> String {
+        GeocodeService::new()
+            .tools()
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("tool '{name}' not found in tools()"))
+            .description
+    }
+
+    /// The server must advertise a non-empty, model-facing `instructions` blurb —
+    /// the daemon uses it as this server's searchable description.
+    #[test]
+    fn server_config_sets_non_empty_instructions() {
+        let instructions = server_config()
+            .instructions
+            .expect("server_config() must set instructions");
+        assert!(
+            !instructions.trim().is_empty(),
+            "instructions must not be empty or whitespace-only"
+        );
+    }
+
+    /// The instructions must name both tools and the core concepts a model would
+    /// search on, so tool discovery routes location questions here.
+    #[test]
+    fn instructions_name_both_tools_and_core_concepts() {
+        let instructions = server_config()
+            .instructions
+            .expect("server_config() must set instructions")
+            .to_lowercase();
+        for needle in ["geocode", "reverse_geocode", "coordinates", "latitude"] {
+            assert!(
+                instructions.contains(needle),
+                "instructions should mention '{needle}', got: {instructions}"
+            );
+        }
+    }
+
+    /// `reverse_geocode` must describe itself in natural terms (coordinates, a
+    /// GPS point, a place) and must not claim to return a full street address —
+    /// the server only surfaces name, country, region, and place type.
+    #[test]
+    fn reverse_geocode_description_is_natural_and_honest() {
+        let desc = tool_description("reverse_geocode").to_lowercase();
+        for needle in ["coordinates", "latitude", "place", "gps"] {
+            assert!(
+                desc.contains(needle),
+                "reverse_geocode description should mention '{needle}', got: {desc}"
+            );
+        }
+        assert!(
+            !desc.contains("address"),
+            "reverse_geocode must not over-claim returning an 'address': {desc}"
+        );
+    }
 }
