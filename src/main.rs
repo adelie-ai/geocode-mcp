@@ -55,10 +55,10 @@ impl McpService for GeocodeService {
             ),
             ToolDef::new(
                 "reverse_geocode",
-                "Resolve geographic coordinates (latitude and longitude) to a location name \
-                 and address using the Photon reverse geocoding API (powered by OpenStreetMap). \
-                 Returns the nearest matching location with its name, country, region, and \
-                 place type.",
+                "Resolve geographic coordinates (latitude and longitude) into the nearest place: \
+                 its name, country, country code, region, and place type. Use this to identify \
+                 what is located at a GPS point or to turn a lat/long fix into a human-readable \
+                 place name. Powered by the Photon reverse geocoding API (OpenStreetMap).",
                 json!({
                     "type": "object",
                     "properties": {
@@ -167,8 +167,15 @@ fn server_config() -> ServerConfig {
     ServerConfig::new("geocode-mcp", env!("CARGO_PKG_VERSION"))
         .without_websocket()
         .instructions(
-            "Geocoding tools backed by the Photon API (OpenStreetMap): \
-             resolve place names to coordinates and back.",
+            "Convert between place names and geographic coordinates. Reach for this \
+             whenever you need the latitude and longitude of a city, street address, \
+             landmark, or point of interest (use `geocode`), or need to turn a lat/long \
+             pair back into a human-readable place name, country, and region (use \
+             `reverse_geocode`) -- for example to supply coordinates to a weather, \
+             mapping, or distance lookup, or to identify where a GPS fix is located. \
+             Backed by the Photon API (OpenStreetMap) with global coverage and no API \
+             key or configuration required; every result is structured (coordinates, \
+             country, country code, region, and place type).",
         )
 }
 
