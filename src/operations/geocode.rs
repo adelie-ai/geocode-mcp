@@ -56,6 +56,8 @@ pub async fn geocode_location_with_base(
     let count = count.clamp(1, 10);
     let language = language.unwrap_or("en");
 
+    log_geocode_request(name);
+
     let response = client
         .get(base_url)
         .query(&[
@@ -118,6 +120,17 @@ pub async fn geocode_location_with_base(
     }
 
     Ok(serde_json::json!(locations))
+}
+
+/// Log that an outbound geocode lookup is starting: geocode-mcp's call to
+/// the upstream Photon API for a place name.
+///
+/// A place name is a tool argument -- content, never an id -- so it stays at
+/// DEBUG and is never attached to a span (a span field would leave the
+/// process with `otel` on regardless of level). Kept as its own function so
+/// a test can drive it directly, without a network call.
+fn log_geocode_request(name: &str) {
+    tracing::debug!(name = %name, "requesting geocode from photon");
 }
 
 #[cfg(test)]

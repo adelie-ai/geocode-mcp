@@ -3,6 +3,7 @@
 
 use crate::error::{GeocodeError, GeocodeMcpError, McpError};
 use crate::operations::{geocode, reverse_geocode};
+use mcp_core::telemetry::metrics::{self, Label};
 use mcp_core::{CallError, McpService, ServerConfig, ToolDef, ToolReply, async_trait};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -109,6 +110,11 @@ impl McpService for GeocodeService {
 }
 
 impl GeocodeService {
+    // `args` carries the place name and is skipped: a tool argument is
+    // content, so it must never become a span field (D10). The span still
+    // gives this handler's own work its own timing, nested under
+    // mcp-core's `mcp.tools.call` span.
+    #[tracing::instrument(skip(self, args))]
     async fn call_geocode(&self, args: &Value) -> Result<ToolReply, CallError> {
         let name = args
             .get("name")
@@ -124,13 +130,16 @@ impl GeocodeService {
         let count = args.get("count").and_then(value_as_u64).unwrap_or(5) as u32;
         let language = args.get("language").and_then(Value::as_str);
 
-        let result = geocode::geocode_location(&self.client, name, count, language)
-            .await
-            .map_err(domain_err_to_call_error)?;
+        let outcome = geocode::geocode_location(&self.client, name, count, language).await;
+        record_upstream_failure("geocode", &outcome);
+        let result = outcome.map_err(domain_err_to_call_error)?;
 
         ToolReply::json(&result).map_err(CallError::from)
     }
 
+    // `args` carries the coordinate pair and is skipped for the same reason
+    // as in `call_geocode`.
+    #[tracing::instrument(skip(self, args))]
     async fn call_reverse_geocode(&self, args: &Value) -> Result<ToolReply, CallError> {
         let latitude = args
             .get("latitude")
@@ -144,10 +153,11 @@ impl GeocodeService {
 
         let language = args.get("language").and_then(Value::as_str);
 
-        let result =
+        let outcome =
             reverse_geocode::reverse_geocode_location(&self.client, latitude, longitude, language)
-                .await
-                .map_err(domain_err_to_call_error)?;
+                .await;
+        record_upstream_failure("reverse_geocode", &outcome);
+        let result = outcome.map_err(domain_err_to_call_error)?;
 
         ToolReply::json(&result).map_err(CallError::from)
     }
@@ -174,6 +184,45 @@ fn domain_err_to_call_error(e: GeocodeMcpError) -> CallError {
 /// Extract a u64 from a JSON value, accepting both numbers and numeric strings.
 fn value_as_u64(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_str()?.parse::<u64>().ok())
+}
+
+/// Classify a lookup failure as an upstream fault worth counting, or `None`
+/// for a business decline (no matching location) or a caller mistake (bad
+/// parameters). Rule 8.2 keeps an operational decline out of a failure
+/// counter: `geocode.upstream_failures` tracks a fault reaching outward, not
+/// an ordinary "no results" answer or a caller's own bad input.
+///
+/// Exhaustive over [`GeocodeMcpError`], so a new variant forces this
+/// classification to be revisited rather than silently landing as "not
+/// counted".
+fn upstream_failure_reason(err: &GeocodeMcpError) -> Option<&'static str> {
+    match err {
+        GeocodeMcpError::Geocode(GeocodeError::ApiError(_)) => Some("http_error"),
+        GeocodeMcpError::Http(_) => Some("network"),
+        GeocodeMcpError::Geocode(GeocodeError::LocationNotFound(_))
+        | GeocodeMcpError::Geocode(GeocodeError::InvalidParameters(_))
+        | GeocodeMcpError::Mcp(_)
+        | GeocodeMcpError::Json(_)
+        | GeocodeMcpError::Io(_) => None,
+    }
+}
+
+/// Count an upstream-reaching failure against `geocode.upstream_failures`.
+///
+/// `tool` is always one of the two `&'static str` literals its two call
+/// sites pass, so the label is bounded there rather than by anything a
+/// caller supplies; `reason` is bounded the same way, by
+/// [`upstream_failure_reason`]'s fixed set of return values. Neither label
+/// is ever built from a place name or a coordinate.
+fn record_upstream_failure(tool: &'static str, outcome: &Result<Value, GeocodeMcpError>) {
+    if let Err(err) = outcome
+        && let Some(reason) = upstream_failure_reason(err)
+    {
+        metrics::increment(
+            "geocode.upstream_failures",
+            &[Label::new("tool", tool), Label::new("reason", reason)],
+        );
+    }
 }
 
 /// Build the MCP server configuration.
@@ -259,8 +308,6 @@ mod tests {
     }
 
     // ── Telemetry (mcp-core#40) ────────────────────────────────────────────
-
-    use mcp_core::telemetry::metrics::{self, Label};
 
     /// The metrics registry [`mcp_core::telemetry::metrics`] records into is
     /// process-global, and `cargo test` runs a file's tests concurrently by

@@ -56,6 +56,8 @@ pub async fn reverse_geocode_location_with_base(
 ) -> Result<Value> {
     let language = language.unwrap_or("en");
 
+    log_reverse_geocode_request(latitude, longitude);
+
     let lat_str = latitude.to_string();
     let lon_str = longitude.to_string();
 
@@ -119,6 +121,21 @@ pub async fn reverse_geocode_location_with_base(
     });
 
     Ok(result)
+}
+
+/// Log that an outbound reverse-geocode lookup is starting: geocode-mcp's
+/// call to the upstream Photon API for a coordinate pair.
+///
+/// A coordinate pair is a tool argument -- content, never an id -- so it
+/// stays at DEBUG and is never attached to a span (a span field would leave
+/// the process with `otel` on regardless of level). Kept as its own function
+/// so a test can drive it directly, without a network call.
+fn log_reverse_geocode_request(latitude: f64, longitude: f64) {
+    tracing::debug!(
+        latitude = %latitude,
+        longitude = %longitude,
+        "requesting reverse geocode from photon"
+    );
 }
 
 #[cfg(test)]
