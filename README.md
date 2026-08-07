@@ -83,6 +83,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 ./target/debug/geocode-mcp ser
 ```bash
 just check                       # default features: fmt, lint, build, test
 just check-otel                  # the same, built with --features otel
+just check-all                   # both -- what the pre-push hook runs
 ```
 
 Network-dependent tests are gated behind `RUN_NETWORK_TESTS=1` so the
