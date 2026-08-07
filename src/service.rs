@@ -257,4 +257,129 @@ mod tests {
             "reverse_geocode must not over-claim returning an 'address': {desc}"
         );
     }
+
+    // ── Telemetry (mcp-core#40) ────────────────────────────────────────────
+
+    use mcp_core::telemetry::metrics::{self, Label};
+
+    /// The metrics registry [`mcp_core::telemetry::metrics`] records into is
+    /// process-global, and `cargo test` runs a file's tests concurrently by
+    /// default. This guards every test below that reads the registry, so a
+    /// concurrent write from elsewhere in this module cannot inflate its
+    /// before/after delta.
+    static METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_metrics() -> std::sync::MutexGuard<'static, ()> {
+        METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A `reqwest::Error` built from a URL that fails to parse. This is a
+    /// client-side failure with no network access at all -- exactly the
+    /// shape of the `Http` variant a real connection failure or timeout
+    /// would also produce, without this test reaching any service.
+    fn synthetic_reqwest_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("not a valid url")
+            .build()
+            .expect_err("a malformed url must fail to build, with no network access")
+    }
+
+    #[test]
+    fn upstream_failure_reason_counts_http_error_and_network_faults() {
+        assert_eq!(
+            upstream_failure_reason(&GeocodeMcpError::Geocode(GeocodeError::ApiError(
+                "x".into()
+            ))),
+            Some("http_error")
+        );
+        assert_eq!(
+            upstream_failure_reason(&GeocodeMcpError::Http(synthetic_reqwest_error())),
+            Some("network")
+        );
+    }
+
+    /// A "no results" answer and bad caller input are declines, not a fault
+    /// reaching outward -- rule 8.2 keeps an operational decline out of a
+    /// failure counter.
+    #[test]
+    fn upstream_failure_reason_excludes_declines_and_caller_errors() {
+        assert_eq!(
+            upstream_failure_reason(&GeocodeMcpError::Geocode(GeocodeError::LocationNotFound(
+                "x".into()
+            ))),
+            None
+        );
+        assert_eq!(
+            upstream_failure_reason(&GeocodeMcpError::Geocode(GeocodeError::InvalidParameters(
+                "x".into()
+            ))),
+            None
+        );
+        assert_eq!(
+            upstream_failure_reason(&GeocodeMcpError::Mcp(McpError::InvalidToolParameters(
+                "x".into()
+            ))),
+            None
+        );
+        let json_err = serde_json::from_str::<Value>("not json").unwrap_err();
+        assert_eq!(
+            upstream_failure_reason(&GeocodeMcpError::Json(json_err)),
+            None
+        );
+        assert_eq!(
+            upstream_failure_reason(&GeocodeMcpError::Io(std::io::Error::other("x"))),
+            None
+        );
+    }
+
+    #[test]
+    fn record_upstream_failure_increments_only_for_counted_reasons() {
+        let _guard = lock_metrics();
+        let labels = [
+            Label::new("tool", "geocode"),
+            Label::new("reason", "http_error"),
+        ];
+        let before = counter_total("geocode.upstream_failures", &labels);
+
+        let ok: Result<Value, GeocodeMcpError> = Ok(json!([]));
+        record_upstream_failure("geocode", &ok);
+        let not_found: Result<Value, GeocodeMcpError> = Err(GeocodeMcpError::Geocode(
+            GeocodeError::LocationNotFound("x".into()),
+        ));
+        record_upstream_failure("geocode", &not_found);
+        assert_eq!(
+            counter_total("geocode.upstream_failures", &labels),
+            before,
+            "a successful call or a 'no results' answer must not move the counter"
+        );
+
+        let http_failed: Result<Value, GeocodeMcpError> =
+            Err(GeocodeMcpError::Geocode(GeocodeError::ApiError("x".into())));
+        record_upstream_failure("geocode", &http_failed);
+        assert_eq!(
+            counter_total("geocode.upstream_failures", &labels),
+            before + 1,
+            "an upstream HTTP error must increment the counter, labelled by tool and reason"
+        );
+    }
+
+    fn counter_total(name: &str, labels: &[Label]) -> u64 {
+        metrics::global()
+            .snapshot()
+            .counters
+            .iter()
+            .find(|counter| counter.name == name && same_labels(&counter.labels, labels))
+            .map_or(0, |counter| counter.total)
+    }
+
+    fn same_labels(recorded: &[Label], wanted: &[Label]) -> bool {
+        recorded.len() == wanted.len()
+            && wanted.iter().all(|want| {
+                recorded
+                    .iter()
+                    .any(|have| have.key() == want.key() && have.value() == want.value())
+            })
+    }
 }
