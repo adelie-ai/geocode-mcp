@@ -1,9 +1,8 @@
 #![deny(warnings)]
 
-// In-process proof of D10 for geocode-mcp: whatever `call_geocode` and
-// `call_reverse_geocode` do with a caller's place name or coordinates, it
-// never becomes a span field, at any level, and it never reaches an event
-// at INFO or above.
+// In-process proof of D10 for geocode-mcp: whatever a tool handler does with
+// a caller's place name or coordinates, it never becomes a span field, at
+// any level, and it never reaches an event at INFO or above.
 //
 // `tests/telemetry_stdio.rs` proves the same thing against the real,
 // installed subscriber; this drives mcp-core's dispatch directly and reads
@@ -13,12 +12,19 @@
 // layer only renders a span's fields on a line when some event fires while
 // that span is entered), so this checks span fields directly rather than
 // relying on the console rendering to surface one.
+//
+// mcp-core#40 lesson 8: table-driven over the whole tool list, not one
+// tool. `support::tool_probes()` is the single table both this file and
+// `tests/telemetry_stdio.rs` iterate; `tool_probe_table_covers_every_advertised_tool`
+// below fails the moment a tool ships without a matching entry.
+
+mod support;
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use mcp_core::{ServerCore, Session};
+use mcp_core::{McpService, ServerCore, Session};
 use serde_json::{Value, json};
 use tracing::Level;
 use tracing::field::{Field, Visit};
@@ -28,18 +34,7 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
 use geocode_mcp::{GeocodeService, server_config};
-
-/// A place name a caller might supply. See `tests/telemetry_stdio.rs` for
-/// why it travels in `language` rather than `name`: the call is driven down
-/// the validation-failure path (missing `name`) so it never reaches the
-/// live Photon API, and `#[instrument(skip(self, args))]` skips the whole
-/// `arguments` object, not individual keys within it, so which key carries
-/// the sentinel does not change what this test proves.
-const SENTINEL_ADDRESS: &str = "MARKER-9f3d1c2a-sentinel-address";
-
-/// A coordinate a caller might supply, carried directly as `longitude` on a
-/// request whose `latitude` is omitted.
-const SENTINEL_LONGITUDE: f64 = -98.765432;
+use support::tool_probes;
 
 #[derive(Clone, Debug)]
 struct RecordedSpan {
@@ -163,36 +158,69 @@ impl Visit for Collector<'_> {
     }
 }
 
-/// AC: no tool-call span field carries a place name or a coordinate, at any
-/// level, and no INFO (or higher) event carries either — for both tools, on
-/// the failure path (missing the other required field, which never reaches
-/// the live Photon API).
+/// AC (mcp-core#40 lesson 8): every tool this server advertises has a
+/// sentinel probe in `support::tool_probes()`. A tool added without one is
+/// silently unaudited by the two tests below, so this fails first and names
+/// the gap instead.
 #[test]
-fn tool_call_leaves_no_address_or_coordinate_in_any_span_field() {
-    let longitude_text = SENTINEL_LONGITUDE.to_string();
-    let recorded = capture_dispatch(&[
-        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "geocode", "arguments": {"count": 3, "language": SENTINEL_ADDRESS}},
-        }),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {"name": "reverse_geocode", "arguments": {"longitude": SENTINEL_LONGITUDE}},
-        }),
-    ]);
+fn tool_probe_table_covers_every_advertised_tool() {
+    let advertised: Vec<String> = GeocodeService::new()
+        .tools()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    let probed: Vec<&str> = tool_probes().iter().map(|p| p.tool).collect();
+
+    for name in &advertised {
+        assert!(
+            probed.contains(&name.as_str()),
+            "tool {name:?} is advertised by tools() but has no entry in \
+             support::tool_probes() -- add one so its arguments are covered by the \
+             leak-detection tests"
+        );
+    }
+    for name in &probed {
+        assert!(
+            advertised.iter().any(|a| a == name),
+            "support::tool_probes() lists {name:?}, which tools() does not advertise -- \
+             remove or fix the stale entry"
+        );
+    }
+}
+
+/// AC: no tool-call span field carries a place name or a coordinate, at any
+/// level, and no INFO (or higher) event carries either -- for every tool in
+/// `support::tool_probes()`, on the failure path (missing the other
+/// required field, which never reaches the live Photon API).
+#[test]
+fn tool_call_leaves_no_probe_sentinel_in_any_span_field() {
+    let probes = tool_probes();
+    let requests: Vec<Value> =
+        std::iter::once(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+            .chain(probes.iter().enumerate().map(|(i, probe)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": i + 2,
+                    "method": "tools/call",
+                    "params": {"name": probe.tool, "arguments": probe.arguments},
+                })
+            }))
+            .collect();
+
+    let recorded = capture_dispatch(&requests);
 
     for span in &recorded.spans {
         for (key, value) in &span.fields {
-            assert!(
-                !value.contains(SENTINEL_ADDRESS) && !value.contains(&longitude_text),
-                "a place name or coordinate reached span {:?} field {key:?}: {value:?}",
-                span.name
-            );
+            for probe in &probes {
+                for sentinel in &probe.sentinels {
+                    assert!(
+                        !value.contains(sentinel.as_str()),
+                        "{}'s sentinel reached span {:?} field {key:?}: {value:?}",
+                        probe.tool,
+                        span.name
+                    );
+                }
+            }
         }
     }
 
@@ -201,68 +229,69 @@ fn tool_call_leaves_no_address_or_coordinate_in_any_span_field() {
             continue;
         }
         for (key, value) in &event.fields {
-            assert!(
-                !value.contains(SENTINEL_ADDRESS) && !value.contains(&longitude_text),
-                "a place name or coordinate reached a {} line, field {key:?}: {value:?}",
-                event.level
-            );
+            for probe in &probes {
+                for sentinel in &probe.sentinels {
+                    assert!(
+                        !value.contains(sentinel.as_str()),
+                        "{}'s sentinel reached a {} line, field {key:?}: {value:?}",
+                        probe.tool,
+                        event.level
+                    );
+                }
+            }
         }
     }
 
-    let address_at_debug = recorded.events.iter().any(|event| {
-        event.level == Level::DEBUG
-            && event
-                .fields
-                .values()
-                .any(|value| value.contains(SENTINEL_ADDRESS))
-    });
-    assert!(
-        address_at_debug,
-        "the place name must still be reachable at DEBUG, or this test cannot tell a real fix \
-         from a line that was simply deleted; the events were {:?}",
-        recorded.event_summary()
-    );
-
-    let longitude_at_debug = recorded.events.iter().any(|event| {
-        event.level == Level::DEBUG
-            && event
-                .fields
-                .values()
-                .any(|value| value.contains(&longitude_text))
-    });
-    assert!(
-        longitude_at_debug,
-        "the coordinate must still be reachable at DEBUG, or this test cannot tell a real fix \
-         from a line that was simply deleted; the events were {:?}",
-        recorded.event_summary()
-    );
+    for probe in &probes {
+        for sentinel in &probe.sentinels {
+            let at_debug = recorded.events.iter().any(|event| {
+                event.level == Level::DEBUG
+                    && event
+                        .fields
+                        .values()
+                        .any(|value| value.contains(sentinel.as_str()))
+            });
+            assert!(
+                at_debug,
+                "{}'s sentinel {sentinel:?} must still be reachable at DEBUG, or this test \
+                 cannot tell a real fix from a line that was simply deleted; the events were \
+                 {:?}",
+                probe.tool,
+                recorded.event_summary()
+            );
+        }
+    }
 }
 
-/// AC: the tool handlers are instrumented — a span opens for each, nested
+/// AC: every tool handler is instrumented -- a span opens for each, nested
 /// under mcp-core's own `mcp.tools.call` span. Without this, the leak test
 /// above could pass simply because nothing was instrumented at all.
 #[test]
-fn each_tool_handler_opens_its_own_span() {
-    let recorded = capture_dispatch(&[
-        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "geocode", "arguments": {"count": 3, "language": SENTINEL_ADDRESS}},
-        }),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {"name": "reverse_geocode", "arguments": {"longitude": SENTINEL_LONGITUDE}},
-        }),
-    ]);
+fn each_probed_tool_handler_opens_its_own_span() {
+    let probes = tool_probes();
+    let requests: Vec<Value> =
+        std::iter::once(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+            .chain(probes.iter().enumerate().map(|(i, probe)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": i + 2,
+                    "method": "tools/call",
+                    "params": {"name": probe.tool, "arguments": probe.arguments},
+                })
+            }))
+            .collect();
 
-    for expected in ["call_geocode", "call_reverse_geocode"] {
+    let recorded = capture_dispatch(&requests);
+
+    for probe in &probes {
         assert!(
-            recorded.spans.iter().any(|span| span.name == expected),
-            "expected a {expected:?} span; the spans were {:?}",
+            recorded
+                .spans
+                .iter()
+                .any(|span| span.name == probe.handler_span),
+            "expected a {:?} span for tool {:?}; the spans were {:?}",
+            probe.handler_span,
+            probe.tool,
             recorded
                 .spans
                 .iter()

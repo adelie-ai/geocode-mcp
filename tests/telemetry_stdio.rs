@@ -12,28 +12,25 @@
 // shows up in console text at all unless an event fires inside that span
 // (lesson 7, mcp-core#40).
 //
-// Neither test calls the live Photon API. Both tool calls below are missing
-// their other required coordinate/name field, so geocode-mcp's own
-// parameter validation rejects them before any outbound request is made —
-// the sentinel travels in a second argument instead, which proves the same
+// mcp-core#40 lesson 8: table-driven over the whole tool list, not one
+// tool. `support::tool_probes()` is the single table both this file and
+// `tests/telemetry_span_fields.rs` iterate.
+//
+// Neither test calls the live Photon API. Every probe's tool call is
+// missing its other required coordinate/name field, so geocode-mcp's own
+// parameter validation rejects it before any outbound request is made -- the
+// sentinel travels in a second argument instead, which proves the same
 // property: mcp-core's dispatch layer logs the whole `arguments` object at
 // DEBUG before the tool handler ever runs (server.rs: `tool call
 // arguments`), regardless of which key in that object carries the value.
+
+mod support;
 
 use serde_json::{Value, json};
 use std::io::Write;
 use std::process::{Child, Command, Output, Stdio};
 
-/// A place name a caller might supply. Carried in `language` on a request
-/// whose `name` is omitted, so the call fails validation (missing name)
-/// before any network access, while the sentinel still reaches the raw
-/// arguments object mcp-core logs at DEBUG.
-const SENTINEL_ADDRESS: &str = "MARKER-9f3d1c2a-sentinel-address";
-
-/// A coordinate a caller might supply. Carried directly as `longitude` on a
-/// request whose `latitude` is omitted, so the call fails validation
-/// (missing latitude) before any network access.
-const SENTINEL_LONGITUDE: f64 = -98.765432;
+use support::tool_probes;
 
 fn spawn_with_log_level(level: &str) -> Child {
     let exe = env!("CARGO_BIN_EXE_geocode-mcp");
@@ -69,34 +66,34 @@ fn line_level(line: &str) -> Option<&str> {
         .filter(|token| matches!(*token, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"))
 }
 
-fn geocode_request(id: u64) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "tools/call",
-        "params": {"name": "geocode", "arguments": {"count": 3, "language": SENTINEL_ADDRESS}},
-    })
-}
-
-fn reverse_geocode_request(id: u64) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "tools/call",
-        "params": {"name": "reverse_geocode", "arguments": {"longitude": SENTINEL_LONGITUDE}},
-    })
+/// One `tools/call` request per probe in `support::tool_probes()`, starting
+/// at JSON-RPC id 100 so it never collides with the fixed ids the two tests
+/// below add around it.
+fn probe_requests() -> Vec<Value> {
+    tool_probes()
+        .iter()
+        .enumerate()
+        .map(|(i, probe)| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 100 + i,
+                "method": "tools/call",
+                "params": {"name": probe.tool, "arguments": probe.arguments},
+            })
+        })
+        .collect()
 }
 
 #[test]
 fn stdout_carries_only_jsonrpc_at_trace_level() {
-    let requests = [
+    let mut requests = vec![
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}),
         json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-        geocode_request(3),
-        reverse_geocode_request(4),
-        json!({"jsonrpc":"2.0","id":5,"method":"shutdown","params":{}}),
     ];
+    requests.extend(probe_requests());
+    requests.push(json!({"jsonrpc":"2.0","id":3,"method":"shutdown","params":{}}));
+
     let output = run_requests("trace", &requests);
     assert!(
         output.status.success(),
@@ -117,8 +114,9 @@ fn stdout_carries_only_jsonrpc_at_trace_level() {
         );
         replies += 1;
     }
+    let requests_with_id = requests.iter().filter(|r| r.get("id").is_some()).count();
     assert_eq!(
-        replies, 5,
+        replies, requests_with_id,
         "expected one reply per request that carried an id"
     );
 
@@ -131,18 +129,19 @@ fn stdout_carries_only_jsonrpc_at_trace_level() {
 }
 
 /// AC (mcp-core#40, D10): no place name and no coordinate reaches an INFO
-/// (or higher) line, for either tool. The failure path is what is driven
-/// here, so the sentinel is present in the raw arguments regardless of
-/// what geocode-mcp's own validation does with them.
+/// (or higher) line, for any tool in `support::tool_probes()`. The failure
+/// path is what is driven here, so each sentinel is present in the raw
+/// arguments regardless of what geocode-mcp's own validation does with them.
 #[test]
-fn no_address_or_coordinate_reaches_an_info_line_on_the_failure_path() {
-    let requests = [
+fn no_probe_sentinel_reaches_an_info_line_on_the_failure_path() {
+    let probes = tool_probes();
+    let mut requests = vec![
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}),
         json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-        geocode_request(2),
-        reverse_geocode_request(3),
-        json!({"jsonrpc":"2.0","id":4,"method":"shutdown","params":{}}),
     ];
+    requests.extend(probe_requests());
+    requests.push(json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":{}}));
+
     let output = run_requests("trace", &requests);
     assert!(
         output.status.success(),
@@ -151,36 +150,32 @@ fn no_address_or_coordinate_reaches_an_info_line_on_the_failure_path() {
     );
 
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    let longitude_text = SENTINEL_LONGITUDE.to_string();
-    let mut saw_address_at_debug = false;
-    let mut saw_longitude_at_debug = false;
 
-    for line in stderr.lines() {
-        let carries_address = line.contains(SENTINEL_ADDRESS);
-        let carries_longitude = line.contains(&longitude_text);
-        if !carries_address && !carries_longitude {
-            continue;
-        }
-        let level = line_level(line);
-        assert!(
-            matches!(level, Some("DEBUG") | Some("TRACE")),
-            "a place name or coordinate reached a line at level {level:?}, at or above INFO: \
-             {line:?}"
-        );
-        if level == Some("DEBUG") {
-            saw_address_at_debug |= carries_address;
-            saw_longitude_at_debug |= carries_longitude;
+    for probe in &probes {
+        for sentinel in &probe.sentinels {
+            let mut saw_at_debug = false;
+            for line in stderr.lines() {
+                if !line.contains(sentinel.as_str()) {
+                    continue;
+                }
+                let level = line_level(line);
+                assert!(
+                    matches!(level, Some("DEBUG") | Some("TRACE")),
+                    "{}'s sentinel reached a line at level {level:?}, at or above INFO: \
+                     {line:?}",
+                    probe.tool
+                );
+                if level == Some("DEBUG") {
+                    saw_at_debug = true;
+                }
+            }
+            assert!(
+                saw_at_debug,
+                "{}'s sentinel {sentinel:?} must still be reachable at DEBUG, or this test \
+                 cannot tell a real fix from a line that was simply deleted; stderr was: \
+                 {stderr:?}",
+                probe.tool
+            );
         }
     }
-
-    assert!(
-        saw_address_at_debug,
-        "the place name must still be reachable at DEBUG, or this test cannot tell a real fix \
-         from a line that was simply deleted; stderr was: {stderr:?}"
-    );
-    assert!(
-        saw_longitude_at_debug,
-        "the coordinate must still be reachable at DEBUG, or this test cannot tell a real fix \
-         from a line that was simply deleted; stderr was: {stderr:?}"
-    );
 }
