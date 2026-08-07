@@ -24,6 +24,15 @@ httpmock = "0.7"
 # through mcp-core's adelie-telemetry dependency, so this adds no crate.
 tracing-subscriber = "0.3.23"
 
+[features]
+# OTLP export of traces, metrics and log records, off by default. A pure
+# passthrough: server -> mcp-core -> adelie-telemetry, so this crate takes no
+# direct dependency on adelie-telemetry or on any opentelemetry crate. With
+# the feature off, cargo tree resolves no opentelemetry crate at all.
+# Configure export with the standard OTEL_* environment variables -- see
+# mcp-core's README for the full list.
+otel = ["mcp-core/otel"]
+
 [lints.rust]
 warnings = "deny"
 
