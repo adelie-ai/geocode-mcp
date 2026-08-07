@@ -7,7 +7,7 @@ use crate::error::{GeocodeError, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-const PHOTON_REVERSE_URL: &str = "https://photon.komoot.io/reverse";
+pub(crate) const PHOTON_REVERSE_URL: &str = "https://photon.komoot.io/reverse";
 
 #[derive(Debug, Deserialize)]
 struct PhotonResponse {

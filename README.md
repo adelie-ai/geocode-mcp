@@ -89,9 +89,18 @@ Network-dependent tests are gated behind `RUN_NETWORK_TESTS=1` so the
 default suite is deterministic and offline. The `tests/telemetry_*.rs`
 files are the telemetry acceptance suite: that stdout carries only
 JSON-RPC at `RUST_LOG=trace`, that no place name or coordinate reaches an
-INFO line or a span field for any tool this server advertises
-(`tests/support/mod.rs` holds one sentinel probe per tool), and that a
-default build resolves no opentelemetry crate.
+INFO line or a span field for any tool this server advertises, on both the
+success path and an upstream failure, and that a default build resolves no
+opentelemetry crate.
+
+`tests/support/mod.rs` holds one sentinel probe per tool. Each probe
+carries valid arguments and points `GeocodeService` at a local mock server
+instead of the live Photon API, so `tests/telemetry_span_fields.rs` reaches
+the real outbound-request code, not just parameter validation.
+`tests/telemetry_stdio.rs` spawns the real binary as a separate process,
+which cannot be redirected to that mock, so it uses deliberately invalid
+arguments instead -- sufficient for what it proves (process-level
+stdout/stderr hygiene under the real, installed subscriber).
 
 ## License
 

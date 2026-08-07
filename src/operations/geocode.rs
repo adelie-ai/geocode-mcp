@@ -7,7 +7,7 @@ use crate::error::{GeocodeError, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-const PHOTON_API_URL: &str = "https://photon.komoot.io/api/";
+pub(crate) const PHOTON_API_URL: &str = "https://photon.komoot.io/api/";
 
 #[derive(Debug, Deserialize)]
 struct PhotonResponse {

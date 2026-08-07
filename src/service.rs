@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 /// The geocoding service - holds the shared `reqwest` client used for all
-/// Photon API calls.
+/// Photon API calls, and the base URL each tool sends its outbound request
+/// to.
 ///
 /// Implements [`McpService`] to expose the `geocode` and `reverse_geocode`
 /// tools. Construct it with [`GeocodeService::new`] (or [`Default`]); it can be
@@ -17,6 +18,8 @@ use std::time::Duration;
 /// [`crate::build_service`].
 pub struct GeocodeService {
     client: reqwest::Client,
+    geocode_base_url: String,
+    reverse_geocode_base_url: String,
 }
 
 impl GeocodeService {
@@ -24,12 +27,28 @@ impl GeocodeService {
     /// client with a 10s request timeout and 5s connect timeout, talking to the
     /// public Photon endpoint (no API key required).
     pub fn new() -> Self {
+        Self::with_base_urls(geocode::PHOTON_API_URL, reverse_geocode::PHOTON_REVERSE_URL)
+    }
+
+    /// Construct a service pointed at custom Photon endpoints.
+    ///
+    /// Why: a test needs to drive a real outbound request -- both
+    /// outbound-request `debug!` sites, the response-parsing branches, and
+    /// `record_upstream_failure` -- through a local mock instead of the
+    /// live API. Production code always goes through [`GeocodeService::new`];
+    /// this constructor exists for that test need.
+    pub fn with_base_urls(
+        geocode_base_url: impl Into<String>,
+        reverse_geocode_base_url: impl Into<String>,
+    ) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .connect_timeout(Duration::from_secs(5))
                 .build()
                 .expect("reqwest client"),
+            geocode_base_url: geocode_base_url.into(),
+            reverse_geocode_base_url: reverse_geocode_base_url.into(),
         }
     }
 }
@@ -130,7 +149,14 @@ impl GeocodeService {
         let count = args.get("count").and_then(value_as_u64).unwrap_or(5) as u32;
         let language = args.get("language").and_then(Value::as_str);
 
-        let outcome = geocode::geocode_location(&self.client, name, count, language).await;
+        let outcome = geocode::geocode_location_with_base(
+            &self.client,
+            &self.geocode_base_url,
+            name,
+            count,
+            language,
+        )
+        .await;
         record_upstream_failure("geocode", &outcome);
         let result = outcome.map_err(domain_err_to_call_error)?;
 
@@ -153,9 +179,14 @@ impl GeocodeService {
 
         let language = args.get("language").and_then(Value::as_str);
 
-        let outcome =
-            reverse_geocode::reverse_geocode_location(&self.client, latitude, longitude, language)
-                .await;
+        let outcome = reverse_geocode::reverse_geocode_location_with_base(
+            &self.client,
+            &self.reverse_geocode_base_url,
+            latitude,
+            longitude,
+            language,
+        )
+        .await;
         record_upstream_failure("reverse_geocode", &outcome);
         let result = outcome.map_err(domain_err_to_call_error)?;
 

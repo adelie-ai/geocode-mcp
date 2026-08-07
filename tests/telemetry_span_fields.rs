@@ -4,19 +4,22 @@
 // a caller's place name or coordinates, it never becomes a span field, at
 // any level, and it never reaches an event at INFO or above.
 //
-// `tests/telemetry_stdio.rs` proves the same thing against the real,
-// installed subscriber; this drives mcp-core's dispatch directly and reads
-// back the spans and events it really emitted, the way mcp-core's own
-// acceptance suite does for its dispatch path. A span field would not
-// necessarily show up on an INFO-level *line* of console text (the fmt
-// layer only renders a span's fields on a line when some event fires while
-// that span is entered), so this checks span fields directly rather than
-// relying on the console rendering to surface one.
+// `tests/telemetry_stdio.rs` proves the complementary thing against the
+// real, installed subscriber: what reaches rendered console *text*. Neither
+// alone is enough -- lesson 7 (mcp-core#40) is that a console-text test
+// cannot see a span-field leak, because a span records its fields at
+// creation and nothing prints them unless an event fires inside that span.
 //
-// mcp-core#40 lesson 8: table-driven over the whole tool list, not one
-// tool. `support::tool_probes()` is the single table both this file and
-// `tests/telemetry_stdio.rs` iterate; `tool_probe_table_covers_every_advertised_tool`
-// below fails the moment a tool ships without a matching entry.
+// Every test below drives its call through `support::mock_service`, so it
+// reaches the *live* body of `geocode_location_with_base` /
+// `reverse_geocode_location_with_base` -- not just geocode-mcp's own
+// parameter validation. An earlier version of this file used
+// validation-rejected requests (a required field omitted) to stay off the
+// network; review found that this left both outbound-request `debug!`
+// sites, and the response-parsing branches, completely unexercised by the
+// leak-detection tests -- a leak added inside either body was uncaught by
+// the full suite. Pointing the service at a local mock instead reaches the
+// real code while still touching no live service (mcp-core#40 lesson 9).
 
 mod support;
 
@@ -24,8 +27,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use mcp_core::telemetry::metrics::{self, Label};
 use mcp_core::{McpService, ServerCore, Session};
-use serde_json::{Value, json};
+use serde_json::json;
 use tracing::Level;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -34,7 +38,7 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
 use geocode_mcp::{GeocodeService, server_config};
-use support::tool_probes;
+use support::{ToolProbe, tool_probes};
 
 #[derive(Clone, Debug)]
 struct RecordedSpan {
@@ -80,14 +84,33 @@ where
     capture.take()
 }
 
-fn capture_dispatch(messages: &[Value]) -> Recorded {
-    let messages = messages.to_vec();
+/// Drive one `tools/call` for `probe` against a `GeocodeService` pointed at
+/// a mock server that answers `probe.mock_path` with `status`/`body`, and
+/// capture what the dispatch emitted. The mock server setup happens inside
+/// the same Tokio runtime `capture` builds, since `httpmock`'s async API
+/// requires one.
+fn capture_probe_call(probe: &ToolProbe, status: u16, body: &'static str) -> Recorded {
+    let mock_path = probe.mock_path;
+    let tool = probe.tool;
+    let arguments = probe.arguments.clone();
+
     capture(|| async move {
-        let core = ServerCore::new(server_config(), Arc::new(GeocodeService::new()));
+        let (_server, service) = support::mock_service(mock_path, status, body).await;
+        let core = ServerCore::new(server_config(), Arc::new(service));
         let mut session = Session::new(core);
-        for message in messages {
-            session.handle_message(message).await;
-        }
+        session
+            .handle_message(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            )
+            .await;
+        session
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            }))
+            .await;
     })
 }
 
@@ -158,10 +181,65 @@ impl Visit for Collector<'_> {
     }
 }
 
+/// No span field and no INFO-or-louder event field may contain any of
+/// `probe`'s sentinels.
+fn assert_no_leak(recorded: &Recorded, probe: &ToolProbe, scenario: &str) {
+    for span in &recorded.spans {
+        for (key, value) in &span.fields {
+            for sentinel in &probe.sentinels {
+                assert!(
+                    !value.contains(sentinel.as_str()),
+                    "[{scenario}] {}'s sentinel reached span {:?} field {key:?}: {value:?}",
+                    probe.tool,
+                    span.name
+                );
+            }
+        }
+    }
+    for event in &recorded.events {
+        if event.level > Level::INFO {
+            continue;
+        }
+        for (key, value) in &event.fields {
+            for sentinel in &probe.sentinels {
+                assert!(
+                    !value.contains(sentinel.as_str()),
+                    "[{scenario}] {}'s sentinel reached a {} line, field {key:?}: {value:?}",
+                    probe.tool,
+                    event.level
+                );
+            }
+        }
+    }
+}
+
+/// Every one of `probe`'s sentinels must still be reachable at DEBUG, or the
+/// no-leak assertion above cannot tell a real fix from a line that was
+/// simply deleted.
+fn assert_debug_positive_control(recorded: &Recorded, probe: &ToolProbe, scenario: &str) {
+    for sentinel in &probe.sentinels {
+        let at_debug = recorded.events.iter().any(|event| {
+            event.level == Level::DEBUG
+                && event
+                    .fields
+                    .values()
+                    .any(|value| value.contains(sentinel.as_str()))
+        });
+        assert!(
+            at_debug,
+            "[{scenario}] {}'s sentinel {sentinel:?} must still be reachable at DEBUG, or the \
+             no-leak assertion cannot tell a real fix from a line that was simply deleted; the \
+             events were {:?}",
+            probe.tool,
+            recorded.event_summary()
+        );
+    }
+}
+
 /// AC (mcp-core#40 lesson 8): every tool this server advertises has a
 /// sentinel probe in `support::tool_probes()`. A tool added without one is
-/// silently unaudited by the two tests below, so this fails first and names
-/// the gap instead.
+/// silently unaudited by the tests below, so this fails first and names the
+/// gap.
 #[test]
 fn tool_probe_table_covers_every_advertised_tool() {
     let advertised: Vec<String> = GeocodeService::new()
@@ -188,102 +266,14 @@ fn tool_probe_table_covers_every_advertised_tool() {
     }
 }
 
-/// AC: no tool-call span field carries a place name or a coordinate, at any
-/// level, and no INFO (or higher) event carries either -- for every tool in
-/// `support::tool_probes()`, on the failure path (missing the other
-/// required field, which never reaches the live Photon API).
-#[test]
-fn tool_call_leaves_no_probe_sentinel_in_any_span_field() {
-    let probes = tool_probes();
-    let requests: Vec<Value> =
-        std::iter::once(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
-            .chain(probes.iter().enumerate().map(|(i, probe)| {
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": i + 2,
-                    "method": "tools/call",
-                    "params": {"name": probe.tool, "arguments": probe.arguments},
-                })
-            }))
-            .collect();
-
-    let recorded = capture_dispatch(&requests);
-
-    for span in &recorded.spans {
-        for (key, value) in &span.fields {
-            for probe in &probes {
-                for sentinel in &probe.sentinels {
-                    assert!(
-                        !value.contains(sentinel.as_str()),
-                        "{}'s sentinel reached span {:?} field {key:?}: {value:?}",
-                        probe.tool,
-                        span.name
-                    );
-                }
-            }
-        }
-    }
-
-    for event in &recorded.events {
-        if event.level > Level::INFO {
-            continue;
-        }
-        for (key, value) in &event.fields {
-            for probe in &probes {
-                for sentinel in &probe.sentinels {
-                    assert!(
-                        !value.contains(sentinel.as_str()),
-                        "{}'s sentinel reached a {} line, field {key:?}: {value:?}",
-                        probe.tool,
-                        event.level
-                    );
-                }
-            }
-        }
-    }
-
-    for probe in &probes {
-        for sentinel in &probe.sentinels {
-            let at_debug = recorded.events.iter().any(|event| {
-                event.level == Level::DEBUG
-                    && event
-                        .fields
-                        .values()
-                        .any(|value| value.contains(sentinel.as_str()))
-            });
-            assert!(
-                at_debug,
-                "{}'s sentinel {sentinel:?} must still be reachable at DEBUG, or this test \
-                 cannot tell a real fix from a line that was simply deleted; the events were \
-                 {:?}",
-                probe.tool,
-                recorded.event_summary()
-            );
-        }
-    }
-}
-
-/// AC: every tool handler is instrumented -- a span opens for each, nested
-/// under mcp-core's own `mcp.tools.call` span. Without this, the leak test
-/// above could pass simply because nothing was instrumented at all.
+/// AC: every tool handler is instrumented -- a span opens for each on a
+/// real, successful call, nested under mcp-core's own `mcp.tools.call`
+/// span. Without this, the leak tests below could pass simply because
+/// nothing was instrumented at all.
 #[test]
 fn each_probed_tool_handler_opens_its_own_span() {
-    let probes = tool_probes();
-    let requests: Vec<Value> =
-        std::iter::once(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
-            .chain(probes.iter().enumerate().map(|(i, probe)| {
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": i + 2,
-                    "method": "tools/call",
-                    "params": {"name": probe.tool, "arguments": probe.arguments},
-                })
-            }))
-            .collect();
-
-    let recorded = capture_dispatch(&requests);
-
-    for probe in &probes {
+    for probe in tool_probes() {
+        let recorded = capture_probe_call(&probe, 200, support::SUCCESS_BODY);
         assert!(
             recorded
                 .spans
@@ -299,4 +289,100 @@ fn each_probed_tool_handler_opens_its_own_span() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+/// AC (mcp-core#40 lesson 9): the success path through the real outbound
+/// call -- not a validation-rejection shortcut -- leaves no probe sentinel
+/// in any span field or INFO-or-louder event, for every tool. This is what
+/// actually reaches `geocode_location_with_base` /
+/// `reverse_geocode_location_with_base` and both outbound-request `debug!`
+/// sites; a leak added inside either body is only caught here.
+#[test]
+fn tool_call_success_leaves_no_probe_sentinel_in_any_span_field() {
+    for probe in tool_probes() {
+        let recorded = capture_probe_call(&probe, 200, support::SUCCESS_BODY);
+        assert_no_leak(&recorded, &probe, "success");
+        assert_debug_positive_control(&recorded, &probe, "success");
+    }
+}
+
+/// AC (mcp-core#40 lesson 9): the failure branch through the real outbound
+/// call also leaves no probe sentinel above DEBUG, for every tool, and
+/// classifies correctly against `geocode.upstream_failures`.
+///
+/// Two upstream shapes:
+/// - No results (`{"features":[]}`): `GeocodeError::LocationNotFound`'s
+///   `Display` embeds the caller's own place name or coordinate -- the
+///   scenario a real upstream response most naturally carries content in.
+///   Rule 8.2 makes this a decline, not a fault, so it must not move the
+///   counter.
+/// - An HTTP error status (429): classified as a fault
+///   (`upstream_failure_reason` -> `"http_error"`), so it must increment
+///   `geocode.upstream_failures`, labelled by tool and reason -- proven
+///   here against a real mocked response, not the synthetically
+///   constructed errors `src/service.rs`'s own unit tests use.
+#[test]
+fn tool_call_failure_branches_leave_no_probe_sentinel_and_classify_correctly() {
+    let _guard = lock_metrics();
+
+    for probe in tool_probes() {
+        let labels = [
+            Label::new("tool", probe.tool),
+            Label::new("reason", "http_error"),
+        ];
+
+        // No results: a decline. Must not move the counter.
+        let before_decline = counter_total("geocode.upstream_failures", &labels);
+        let recorded = capture_probe_call(&probe, 200, support::NO_RESULTS_BODY);
+        assert_no_leak(&recorded, &probe, "no-results");
+        assert_debug_positive_control(&recorded, &probe, "no-results");
+        assert_eq!(
+            counter_total("geocode.upstream_failures", &labels),
+            before_decline,
+            "[no-results] a 'no results' decline must not increment geocode.upstream_failures \
+             for {:?}",
+            probe.tool
+        );
+
+        // HTTP error: a fault. Must increment the counter.
+        let before_fault = counter_total("geocode.upstream_failures", &labels);
+        let recorded = capture_probe_call(&probe, 429, "");
+        assert_no_leak(&recorded, &probe, "http-error");
+        assert_eq!(
+            counter_total("geocode.upstream_failures", &labels),
+            before_fault + 1,
+            "[http-error] an upstream HTTP error must increment geocode.upstream_failures \
+             labelled tool={:?} reason=\"http_error\"",
+            probe.tool
+        );
+    }
+}
+
+/// The metrics registry [`mcp_core::telemetry::metrics`] records into is
+/// process-global, and `cargo test` runs a file's tests concurrently by
+/// default. This guards the test above that reads it.
+static METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_metrics() -> std::sync::MutexGuard<'static, ()> {
+    METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn counter_total(name: &str, labels: &[Label]) -> u64 {
+    metrics::global()
+        .snapshot()
+        .counters
+        .iter()
+        .find(|counter| counter.name == name && same_labels(&counter.labels, labels))
+        .map_or(0, |counter| counter.total)
+}
+
+fn same_labels(recorded: &[Label], wanted: &[Label]) -> bool {
+    recorded.len() == wanted.len()
+        && wanted.iter().all(|want| {
+            recorded
+                .iter()
+                .any(|have| have.key() == want.key() && have.value() == want.value())
+        })
 }

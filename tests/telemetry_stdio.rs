@@ -5,24 +5,26 @@
 // caller-supplied place name or coordinate never reaches an INFO line (D10,
 // the level contract).
 //
-// Each test spawns the real binary. Only a real process proves what reaches
-// file descriptor 1 and what the installed subscriber really writes to
-// stderr; an in-process capturing layer (tests/telemetry_span_fields.rs)
-// proves the complementary thing: what reaches a span *field*, which never
-// shows up in console text at all unless an event fires inside that span
-// (lesson 7, mcp-core#40).
+// Each test spawns the real binary as a separate OS process. Only a real
+// process proves what reaches file descriptor 1 and what the installed
+// subscriber really writes to stderr; an in-process capturing layer
+// (tests/telemetry_span_fields.rs) proves the complementary thing: what
+// reaches a span *field*, which never shows up in console text at all
+// unless an event fires inside that span (lesson 7, mcp-core#40).
 //
-// mcp-core#40 lesson 8: table-driven over the whole tool list, not one
-// tool. `support::tool_probes()` is the single table both this file and
-// `tests/telemetry_span_fields.rs` iterate.
-//
-// Neither test calls the live Photon API. Every probe's tool call is
-// missing its other required coordinate/name field, so geocode-mcp's own
-// parameter validation rejects it before any outbound request is made -- the
-// sentinel travels in a second argument instead, which proves the same
-// property: mcp-core's dispatch layer logs the whole `arguments` object at
-// DEBUG before the tool handler ever runs (server.rs: `tool call
-// arguments`), regardless of which key in that object carries the value.
+// This file does NOT use `support::tool_probes()`. That table carries
+// valid, sentinel-bearing arguments so `tests/telemetry_span_fields.rs` can
+// point the service at a local mock and reach the live outbound-request
+// code (mcp-core#40 lesson 9). A spawned OS process has no such mock to
+// reach -- it is the real, unmodified binary -- so driving it with the same
+// valid arguments would make this test call the live Photon API, which the
+// ticket forbids. The probes below stay deliberately invalid instead (a
+// required field is missing, so geocode-mcp's own validation rejects the
+// call before any outbound request), which is sufficient for what this
+// file actually proves: process-level stdout/stderr hygiene under the real,
+// installed subscriber. The sentinel still reaches mcp-core's own raw
+// arguments log (DEBUG), which is what supplies this file's positive
+// control.
 
 mod support;
 
@@ -30,7 +32,35 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::process::{Child, Command, Output, Stdio};
 
-use support::tool_probes;
+/// One tool's request for this file's process-hygiene tests: deliberately
+/// invalid (missing a required field), so it is safe to send to the real,
+/// unmodified binary.
+struct StdioProbe {
+    tool: &'static str,
+    arguments: Value,
+    sentinels: Vec<String>,
+}
+
+fn stdio_probes() -> Vec<StdioProbe> {
+    vec![
+        StdioProbe {
+            tool: "geocode",
+            // `name` is omitted so this call fails validation (missing
+            // name) before any network access; the sentinel travels
+            // through `language` instead, which still reaches mcp-core's
+            // raw-arguments DEBUG log regardless of which key carries it.
+            arguments: json!({"count": 3, "language": support::SENTINEL_ADDRESS}),
+            sentinels: vec![support::SENTINEL_ADDRESS.to_string()],
+        },
+        StdioProbe {
+            tool: "reverse_geocode",
+            // `latitude` is omitted so this call fails validation (missing
+            // latitude) before any network access.
+            arguments: json!({"longitude": support::SENTINEL_LONGITUDE}),
+            sentinels: vec![support::SENTINEL_LONGITUDE.to_string()],
+        },
+    ]
+}
 
 fn spawn_with_log_level(level: &str) -> Child {
     let exe = env!("CARGO_BIN_EXE_geocode-mcp");
@@ -66,11 +96,11 @@ fn line_level(line: &str) -> Option<&str> {
         .filter(|token| matches!(*token, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"))
 }
 
-/// One `tools/call` request per probe in `support::tool_probes()`, starting
-/// at JSON-RPC id 100 so it never collides with the fixed ids the two tests
+/// One `tools/call` request per probe in [`stdio_probes`], starting at
+/// JSON-RPC id 100 so it never collides with the fixed ids the two tests
 /// below add around it.
 fn probe_requests() -> Vec<Value> {
-    tool_probes()
+    stdio_probes()
         .iter()
         .enumerate()
         .map(|(i, probe)| {
@@ -129,12 +159,12 @@ fn stdout_carries_only_jsonrpc_at_trace_level() {
 }
 
 /// AC (mcp-core#40, D10): no place name and no coordinate reaches an INFO
-/// (or higher) line, for any tool in `support::tool_probes()`. The failure
-/// path is what is driven here, so each sentinel is present in the raw
-/// arguments regardless of what geocode-mcp's own validation does with them.
+/// (or higher) line, for any tool in [`stdio_probes`]. The failure path is
+/// what is driven here, so each sentinel is present in the raw arguments
+/// regardless of what geocode-mcp's own validation does with them.
 #[test]
 fn no_probe_sentinel_reaches_an_info_line_on_the_failure_path() {
-    let probes = tool_probes();
+    let probes = stdio_probes();
     let mut requests = vec![
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}),
         json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
