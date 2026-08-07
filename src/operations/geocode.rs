@@ -7,7 +7,7 @@ use crate::error::{GeocodeError, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-const PHOTON_API_URL: &str = "https://photon.komoot.io/api/";
+pub(crate) const PHOTON_API_URL: &str = "https://photon.komoot.io/api/";
 
 #[derive(Debug, Deserialize)]
 struct PhotonResponse {
@@ -55,6 +55,8 @@ pub async fn geocode_location_with_base(
 ) -> Result<Value> {
     let count = count.clamp(1, 10);
     let language = language.unwrap_or("en");
+
+    log_geocode_request(name);
 
     let response = client
         .get(base_url)
@@ -118,4 +120,88 @@ pub async fn geocode_location_with_base(
     }
 
     Ok(serde_json::json!(locations))
+}
+
+/// Log that an outbound geocode lookup is starting: geocode-mcp's call to
+/// the upstream Photon API for a place name.
+///
+/// A place name is a tool argument -- content, never an id -- so it stays at
+/// DEBUG and is never attached to a span (a span field would leave the
+/// process with `otel` on regardless of level). Kept as its own function so
+/// a test can drive it directly, without a network call.
+fn log_geocode_request(name: &str) {
+    tracing::debug!(name = %name, "requesting geocode from photon");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AC (mcp-core#40): each outbound Photon lookup logs a `debug!` event
+    /// naming the place name, so an operator debugging a slow or failed
+    /// geocode has something to correlate against -- and only at DEBUG,
+    /// because a place name is content (D10).
+    #[test]
+    fn log_geocode_request_puts_the_name_at_debug_only() {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        type LoggedEvent = (tracing::Level, BTreeMap<String, String>);
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<LoggedEvent>>>);
+
+        struct Collector<'a>(&'a mut BTreeMap<String, String>);
+        impl Visit for Collector<'_> {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut fields = BTreeMap::new();
+                event.record(&mut Collector(&mut fields));
+                self.0
+                    .lock()
+                    .expect("capture lock is only held to push one record")
+                    .push((*event.metadata().level(), fields));
+            }
+        }
+
+        const SENTINEL: &str = "MARKER-9f3d1c2a-sentinel-address";
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            log_geocode_request(SENTINEL);
+        });
+
+        let events = capture
+            .0
+            .lock()
+            .expect("capture lock is only held to push one record");
+        assert_eq!(
+            events.len(),
+            1,
+            "requesting a geocode lookup must log exactly one event: {events:?}"
+        );
+        let (level, fields) = &events[0];
+        assert_eq!(
+            *level,
+            tracing::Level::DEBUG,
+            "the outbound request must log at DEBUG, so it stays off the INFO band"
+        );
+        assert_eq!(
+            fields.get("name").map(String::as_str),
+            Some(SENTINEL),
+            "the event must carry the name that was looked up"
+        );
+    }
 }
